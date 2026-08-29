@@ -1,0 +1,739 @@
+// What this binding claims, checked against a real PostgreSQL server.
+//
+// **Most of these need a server, and that is deliberate.** A libpq binding is a wire protocol, an
+// authentication handshake and a type system that all live on the other side of a socket; a suite
+// that mocked them would be checking that this file agrees with itself. What is checked here is what
+// PostgreSQL actually sends back.
+//
+// `README.md § Running the suite` has the four commands that start one. The connection string comes
+// from `SYSL_PG_TEST` and falls back to a server on 127.0.0.1:5433, which is what those commands
+// bring up; **an absent server reddens the suite rather than skipping it**, since a green run over
+// nothing is the one result worth less than a red one.
+//
+// The handful of tests at the top need no server at all -- the struct layout, the health check
+// against a port with nothing on it, and a connect that must fail.
+
+module sh.sysl.postgres
+@tests
+
+import sh.sysl.postgres.c
+import sysl.harness.*
+import sysl.env.get_or
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// Where the test server is. Overridable, because a machine that already runs PostgreSQL on 5432 for
+// its own reasons should not have this suite writing tables into it.
+private conninfo() -> string =
+    get_or("SYSL_PG_TEST", "host=127.0.0.1 port=5433 dbname=postgres user=sysl")
+
+// A connection, or a failure that says what to do about it rather than `unwrap`'s panic.
+private db() -> &Connection
+    connect(conninfo()) match
+        Ok(c) -> c
+        Err(e) ->
+            assert(false, s"no server at '${conninfo()}' — see README § Running the suite: ${why(e)}")
+            connect(conninfo()).unwrap()
+
+private why(e: Error) -> string = e match
+    Error.Connect(w) -> w
+    Error.Failed(state, w) -> s"$state $w"
+    Error.Send(w) -> w
+    Error.NoMemory -> "out of memory"
+
+private state_of(e: Error) -> string = e match
+    Error.Failed(state, _) -> state
+    _ -> ""
+
+private same(got: []const u8, want: []const u8, what: string = "bytes differ") =
+    assert_eq(got, want, what)
+
+// -- no server needed ---------------------------------------------------------------------------
+
+// A version of libpq that reordered or grew `PGnotify` would have `notification()` reading the wrong
+// field, and nothing about the value it produced would look wrong. The header declares the struct
+// rather than hiding it, so the layout is checkable.
+@test("the PGnotify layout this package declares is the one the header has")
+notify_layout_matches_the_header()
+    assert_eq(sizeof(c.Notify), c.NOTIFY_SIZE, "PGnotify size")
+    assert_eq(offsetof(c.Notify, relname), c.NOTIFY_RELNAME, "relname offset")
+    assert_eq(offsetof(c.Notify, be_pid), c.NOTIFY_BE_PID, "be_pid offset")
+    assert_eq(offsetof(c.Notify, extra), c.NOTIFY_EXTRA, "extra offset")
+
+// The two connection states the header says may be relied upon, and the four polling states, all
+// read out of the real enumeration rather than written down as numbers here.
+@test("the status and polling constants are the header's own")
+constants_are_distinct()
+    assert(c.CONNECTION_OK != c.CONNECTION_BAD, "the two connection states differ")
+    assert(c.POLLING_READING != c.POLLING_WRITING, "reading and writing differ")
+    assert(c.POLLING_OK != c.POLLING_FAILED, "ok and failed differ")
+    assert(c.TUPLES_OK != c.FATAL_ERROR, "tuples and fatal differ")
+    assert_eq(c.QUERY_PARAM_MAX_LIMIT, 65535, "the protocol's parameter limit")
+
+// `health` costs no session on the server, which is the reason to have it — and against a port with
+// nothing listening it must say so rather than hanging or answering `Up`.
+@test("a port with nothing on it is silent")
+health_of_a_dead_port()
+    assert_eq(health("host=127.0.0.1 port=1 connect_timeout=2") == Health.Silent, true,
+              "a closed port answers Silent")
+
+// A failed connect still hands back a `PGconn`, which is how libpq reports the failure — so this is
+// also the test that `Connection`'s `Drop` runs on one that never connected.
+@test("connecting to a port with nothing on it fails with a message")
+connect_to_a_dead_port_fails()
+    connect("host=127.0.0.1 port=1 connect_timeout=2") match
+        Ok(_) -> assert(false, "there is nothing on port 1")
+        Err(e) -> assert(why(e) != "", "the failure carries libpq's message")
+
+// -- connecting ---------------------------------------------------------------------------------
+
+@test("a connection reports what it connected to")
+connects_and_reports_itself()
+    var c = db()
+
+    assert_eq(c.status() == Status.Ready, true, "the connection is usable")
+    assert(c.server_version() > 0, "the server version is known")
+    assert(c.socket() >= 0, "there is a socket to poll")
+    assert(c.database() != "", "the database is named")
+    assert_eq(c.error(), "", "nothing has gone wrong yet")
+
+// -- parameters ---------------------------------------------------------------------------------
+
+@test("a scalar select answers one row and one column")
+a_scalar_select()
+    var c = db()
+    val rows = c.query("select 42", []).unwrap()
+
+    assert_eq(rows.rows(), 1, "one row")
+    assert_eq(rows.columns(), 1, "one column")
+    assert_eq(rows.integer(0, 0).unwrap(), 42, "the value")
+
+@test("parameters travel beside the command, not inside it")
+parameters_go_out_of_band()
+    var c = db()
+    val rows = c.query("select $1::int + $2::int", [Param.Text("40"), Param.Text("2")]).unwrap()
+
+    assert_eq(rows.integer(0, 0).unwrap(), 42, "the server added them")
+
+// The whole reason `PQexec` is not bound. Written into the SQL this would end the statement and
+// start another; as a parameter it is a string with a semicolon in it and nothing more.
+@test("a parameter that looks like SQL is a value")
+a_parameter_that_looks_like_sql()
+    var c = db()
+    val nasty = "'; drop table nothing; --"
+    val rows = c.query("select $1::text", [Param.Text(nasty)]).unwrap()
+
+    assert_eq(rows.text(0, 0).unwrap(), nasty, "it came back as itself")
+
+@test("an empty parameter list still goes through the parameterised path")
+no_parameters()
+    var c = db()
+    val rows = c.query("select 'plain'", []).unwrap()
+
+    assert_eq(rows.text(0, 0).unwrap(), "plain", "the value")
+
+// -- NULL ---------------------------------------------------------------------------------------
+
+// `PQgetvalue` answers an empty string for both, which is why `is_null` exists at all.
+@test("NULL and the empty string are different values")
+null_is_not_an_empty_string()
+    var c = db()
+    val rows = c.query("select $1::text, $2::text", [Param.Null, Param.Text("")]).unwrap()
+
+    assert_eq(rows.is_null(0, 0), true, "the first is NULL")
+    assert_eq(rows.is_null(0, 1), false, "the second is an empty string")
+    assert_eq(rows.text(0, 0).is_none(), true, "NULL reads as None")
+    assert_eq(rows.text(0, 1).unwrap(), "", "the empty string reads as itself")
+
+@test("a NULL integer is None rather than zero")
+null_integer_is_none()
+    var c = db()
+    val rows = c.query("select null::int", []).unwrap()
+
+    assert_eq(rows.integer(0, 0).is_none(), true, "NULL is not zero")
+
+// -- reading a result ---------------------------------------------------------------------------
+
+@test("columns carry the names the server gave them")
+columns_are_named()
+    var c = db()
+    val rows = c.query("select 1 as alpha, 2 as beta", []).unwrap()
+
+    assert_eq(rows.name(0), "alpha", "first column")
+    assert_eq(rows.name(1), "beta", "second column")
+    assert_eq(rows.column("beta").unwrap(), 1, "found by name")
+    assert_eq(rows.column("gamma").is_none(), true, "a name that is not there")
+
+@test("a column reports its PostgreSQL type")
+type_of_reports_the_oid()
+    var c = db()
+    val rows = c.query("select 1::int4, 'x'::text, '\\x00'::bytea", []).unwrap()
+
+    assert_eq(rows.type_of(0), 23, "int4")
+    assert_eq(rows.type_of(1), 25, "text")
+    assert_eq(rows.type_of(2), 17, "bytea")
+
+@test("integers, floats and booleans read as themselves")
+scalars_read_as_themselves()
+    var c = db()
+    val rows = c.query("select 7::bigint, 1.5::float8, true, false", []).unwrap()
+
+    assert_eq(rows.integer(0, 0).unwrap(), 7, "an integer")
+    assert_eq(rows.number(0, 1).unwrap(), 1.5, "a float")
+    assert_eq(rows.boolean(0, 2).unwrap(), true, "t")
+    assert_eq(rows.boolean(0, 3).unwrap(), false, "f")
+
+// `integer` on a text column answers `None`, which is the same answer NULL gives — `text` is what
+// tells them apart, and this is the test that says so out loud.
+@test("a column that does not hold a number answers None, as NULL does")
+a_column_that_is_not_a_number()
+    var c = db()
+    val rows = c.query("select 'not a number'::text", []).unwrap()
+
+    assert_eq(rows.integer(0, 0).is_none(), true, "unparsable is None")
+    assert_eq(rows.is_null(0, 0), false, "and it is not NULL")
+    assert_eq(rows.text(0, 0).unwrap(), "not a number", "text has it")
+
+@test("many rows come back in order")
+many_rows()
+    var c = db()
+    val rows = c.query("select g from generate_series(1, 5) as g", []).unwrap()
+
+    assert_eq(rows.rows(), 5, "five rows")
+
+    for i in 0..<rows.rows()
+        assert_eq(rows.integer(i, 0).unwrap(), long(i) + 1, s"row $i")
+
+@test("an empty result has no rows and does not fail")
+an_empty_result()
+    var c = db()
+    val rows = c.query("select 1 where false", []).unwrap()
+
+    assert_eq(rows.rows(), 0, "no rows")
+    assert_eq(rows.columns(), 1, "but still a column")
+
+// -- commands -----------------------------------------------------------------------------------
+
+@test("a command reports its tag and how many rows it touched")
+a_command_reports_what_it_did()
+    var c = db()
+
+    c.query("drop table if exists sysl_pq_counts", []).unwrap()
+    c.query("create table sysl_pq_counts (n int)", []).unwrap()
+
+    val put = c.query("insert into sysl_pq_counts (n) values (1), (2), (3)", []).unwrap()
+
+    assert_eq(put.affected(), 3, "three rows inserted")
+    assert_eq(put.tag(), "INSERT 0 3", "the command tag")
+
+    val gone = c.query("delete from sysl_pq_counts where n > 1", []).unwrap()
+
+    assert_eq(gone.affected(), 2, "two rows deleted")
+
+    c.query("drop table sysl_pq_counts", []).unwrap()
+
+// -- failures -----------------------------------------------------------------------------------
+
+@test("a syntax error carries SQLSTATE 42601")
+a_syntax_error()
+    var c = db()
+
+    c.query("this is not sql", []) match
+        Ok(_) -> assert(false, "that is not SQL")
+        Err(e) -> assert_eq(state_of(e), syntax_error, "the SQLSTATE")
+
+@test("an undefined table carries SQLSTATE 42P01")
+an_undefined_table()
+    var c = db()
+
+    c.query("select * from a_table_that_is_not_there", []) match
+        Ok(_) -> assert(false, "there is no such table")
+        Err(e) -> assert_eq(state_of(e), undefined_table, "the SQLSTATE")
+
+// The one every application actually branches on: an insert that collided with a unique index is a
+// retry or a 409, and telling it apart from every other failure is what the code is for.
+@test("a unique violation carries SQLSTATE 23505")
+a_unique_violation()
+    var c = db()
+
+    c.query("drop table if exists sysl_pq_unique", []).unwrap()
+    c.query("create table sysl_pq_unique (k text primary key)", []).unwrap()
+    c.query("insert into sysl_pq_unique (k) values ($1)", [Param.Text("a")]).unwrap()
+
+    c.query("insert into sysl_pq_unique (k) values ($1)", [Param.Text("a")]) match
+        Ok(_) -> assert(false, "the second insert must collide")
+        Err(e) -> assert_eq(state_of(e), unique_violation, "the SQLSTATE")
+
+    c.query("drop table sysl_pq_unique", []).unwrap()
+
+@test("a not-null violation carries SQLSTATE 23502")
+a_not_null_violation()
+    var c = db()
+
+    c.query("drop table if exists sysl_pq_notnull", []).unwrap()
+    c.query("create table sysl_pq_notnull (k text not null)", []).unwrap()
+
+    c.query("insert into sysl_pq_notnull (k) values ($1)", [Param.Null]) match
+        Ok(_) -> assert(false, "NULL is refused there")
+        Err(e) -> assert_eq(state_of(e), not_null_violation, "the SQLSTATE")
+
+    c.query("drop table sysl_pq_notnull", []).unwrap()
+
+@test("a failure carries the server's message as well as its code")
+a_failure_carries_a_message()
+    var c = db()
+
+    c.query("select * from a_table_that_is_not_there", []) match
+        Ok(_) -> assert(false, "there is no such table")
+        Err(e) -> assert(why(e) != "", "the message is not empty")
+
+// -- bytes --------------------------------------------------------------------------------------
+
+@test("a binary parameter goes in and comes back out through bytea")
+bytea_round_trips()
+    var c = db()
+    val sent: []const u8 = [0, 1, 127, 128, 255, 10, 13]
+    val rows = c.query("select $1::bytea", [Param.Binary(sent)]).unwrap()
+
+    val got = rows.bytea(0, 0).unwrap()
+
+    same(got.view(), sent, "the bytes survived the round trip")
+
+@test("bytea on a column that is not hex answers None rather than guessing")
+bytea_of_something_else()
+    var c = db()
+    val rows = c.query("select 'plain text'::text", []).unwrap()
+
+    assert_eq(rows.bytea(0, 0).is_none(), true, "no \\x prefix, no guess")
+
+@test("binary format hands back the wire bytes")
+binary_format()
+    var c = db()
+    val rows = c.query("select 1::int4", [], Format.Binary).unwrap()
+
+    val b = rows.bytes(0, 0).unwrap()
+
+    assert_eq(b.len, 4, "an int4 is four bytes")
+    same(b, [0, 0, 0, 1], "big-endian, which is what the protocol says")
+
+@test("a NUL byte survives a text parameter")
+a_nul_free_text_parameter()
+    var c = db()
+    val rows = c.query("select length($1::text)", [Param.Text("héllo")]).unwrap()
+
+    assert_eq(rows.integer(0, 0).unwrap(), 5, "five characters, six bytes")
+
+// -- identifiers --------------------------------------------------------------------------------
+
+// A parameter cannot be a table name, so this is the one place a name is written into SQL — and the
+// quoting is libpq's, which knows the server's encoding and its `standard_conforming_strings`.
+@test("an identifier is quoted by libpq, doubling any quote inside it")
+identifier_quoting()
+    var c = db()
+
+    assert_eq(c.identifier("users").unwrap(), "\"users\"", "an ordinary name")
+    assert_eq(c.identifier("odd\"name").unwrap(), "\"odd\"\"name\"", "a name with a quote in it")
+    assert_eq(c.identifier("Mixed Case").unwrap(), "\"Mixed Case\"", "a name needing its case kept")
+
+@test("a quoted identifier can then be used")
+a_quoted_identifier_works()
+    var c = db()
+    val name = c.identifier("sysl pq odd").unwrap()
+
+    c.query(s"drop table if exists $name", []).unwrap()
+    c.query(s"create table $name (n int)", []).unwrap()
+    c.query(s"insert into $name values (1)", []).unwrap()
+
+    val rows = c.query(s"select n from $name", []).unwrap()
+
+    assert_eq(rows.integer(0, 0).unwrap(), 1, "it round-tripped")
+
+    c.query(s"drop table $name", []).unwrap()
+
+// -- transactions -------------------------------------------------------------------------------
+
+@test("transaction status follows begin, a failure, and rollback")
+transaction_status_follows_the_session()
+    var c = db()
+
+    assert_eq(c.transaction() == Transaction.Idle, true, "idle to start")
+
+    c.query("begin", []).unwrap()
+
+    assert_eq(c.transaction() == Transaction.InTransaction, true, "in a transaction")
+
+    c.query("select nonsense_function()", []) match
+        Ok(_) -> assert(false, "there is no such function")
+        Err(_) -> ()
+
+    assert_eq(c.transaction() == Transaction.InError, true, "the transaction is now poisoned")
+
+    c.query("rollback", []).unwrap()
+
+    assert_eq(c.transaction() == Transaction.Idle, true, "idle again")
+
+// -- the asynchronous path ----------------------------------------------------------------------
+
+// The whole state machine, with a `poll` loop where a server would have a `select` or a libuv poll
+// handle. Nothing here blocks on the connect.
+@test("connect_start, poll to ready, send, and drain the result")
+the_async_path()
+    var c = connect_start(conninfo()).unwrap()
+
+    var ready = false
+
+    while !ready
+        c.poll() match
+            Poll.Ready -> ready = true
+            Poll.Failed -> assert(false, s"the connect failed: ${c.error()}")
+            _ -> ()
+
+    assert_eq(c.status() == Status.Ready, true, "connected without blocking on it")
+
+    c.send("select 11 union all select 22 order by 1", []).unwrap()
+
+    var seen: Buf[long] = buf()
+    var draining = true
+
+    while draining
+        c.consume().unwrap()
+
+        if !c.busy()
+            c.result().unwrap() match
+                Some(rows) ->
+                    for i in 0..<rows.rows()
+                        seen.push(rows.integer(i, 0).unwrap())
+                None -> draining = false
+
+    assert_eq(seen.len(), 2, "both rows arrived")
+    assert_eq(seen.at(0), 11, "the first")
+    assert_eq(seen.at(1), 22, "the second")
+
+// The rule that is easy to get wrong: a connection whose last result was never collected refuses the
+// next command. This is that rule, stated as a test.
+@test("a drained connection is usable for the next command")
+draining_leaves_the_connection_usable()
+    var c = db()
+
+    c.send("select 1", []).unwrap()
+
+    var draining = true
+
+    while draining
+        c.consume().unwrap()
+
+        if !c.busy()
+            c.result().unwrap() match
+                Some(_) -> ()
+                None -> draining = false
+
+    val rows = c.query("select 2", []).unwrap()
+
+    assert_eq(rows.integer(0, 0).unwrap(), 2, "the next command worked")
+
+@test("single-row mode delivers one row per result")
+single_row_mode_delivers_one_at_a_time()
+    var c = db()
+
+    c.send("select g from generate_series(1, 3) as g", []).unwrap()
+    c.single_row_mode().unwrap()
+
+    var rows_seen = 0
+    var results = 0
+    var draining = true
+
+    while draining
+        c.consume().unwrap()
+
+        if !c.busy()
+            c.result().unwrap() match
+                Some(rows) ->
+                    results += 1
+                    rows_seen += int(rows.rows())
+                None -> draining = false
+
+    assert_eq(rows_seen, 3, "three rows in total")
+    assert_eq(results, 4, "three single-row results and a final empty one")
+
+// A failure on the asynchronous path arrives through `result`, not through `send` — which is worth
+// pinning, because the obvious reading is that a bad command is refused when it is sent.
+@test("an asynchronous failure arrives at result, not at send")
+an_async_failure()
+    var c = db()
+
+    c.send("this is not sql either", []).unwrap()
+
+    var got = ""
+    var draining = true
+
+    while draining
+        c.consume().unwrap()
+
+        if !c.busy()
+            c.result() match
+                Ok(Some(_)) -> ()
+                Ok(None) -> draining = false
+                Err(e) -> got = state_of(e)
+
+    assert_eq(got, syntax_error, "the SQLSTATE came through result")
+
+// -- notifications ------------------------------------------------------------------------------
+
+// `LISTEN`/`NOTIFY` is PostgreSQL's own pub/sub, and it is the reason `consume` is public: a program
+// that only listens still has to read the socket for anything to arrive.
+@test("a NOTIFY is delivered with its channel and payload")
+a_notification_arrives()
+    var c = db()
+
+    c.query("listen sysl_pq_channel", []).unwrap()
+    c.query("notify sysl_pq_channel, 'the payload'", []).unwrap()
+    c.consume().unwrap()
+
+    c.notification() match
+        Some(n) ->
+            assert_eq(n.channel, "sysl_pq_channel", "the channel")
+            assert_eq(n.payload, "the payload", "the payload")
+            assert(n.pid > 0, "the notifying backend's pid")
+        None -> assert(false, "the notification did not arrive")
+
+    assert_eq(c.notification().is_none(), true, "and there is only the one")
+
+// -- cancelling ---------------------------------------------------------------------------------
+
+// A cancel is a request rather than a guarantee, so what is asserted is that it was delivered and
+// that the query it landed on ended — `57014` is what a cancel that arrived in time looks like.
+@test("a cancel stops a query that is already running")
+a_cancel_lands()
+    var c = db()
+
+    c.send("select pg_sleep(30)", []).unwrap()
+    c.cancel().unwrap()
+
+    var state = ""
+    var draining = true
+
+    while draining
+        c.consume().unwrap()
+
+        if !c.busy()
+            c.result() match
+                Ok(Some(_)) -> ()
+                Ok(None) -> draining = false
+                Err(e) -> state = state_of(e)
+
+    assert_eq(state, "57014", "query_canceled")
+
+// -- the guards ---------------------------------------------------------------------------------
+
+@test("reading past the last row is refused", should_trap)
+reading_past_the_last_row()
+    var c = db()
+    val rows = c.query("select 1", []).unwrap()
+
+    rows.text(1, 0)
+
+@test("reading past the last column is refused", should_trap)
+reading_past_the_last_column()
+    var c = db()
+    val rows = c.query("select 1", []).unwrap()
+
+    rows.text(0, 1)
+
+@test("naming a column past the end is refused", should_trap)
+naming_a_column_past_the_end()
+    var c = db()
+    val rows = c.query("select 1", []).unwrap()
+
+    rows.name(1)
+
+// -- the parameter buffer -----------------------------------------------------------------------
+
+// **The test the design of `bind` exists for.** Every parameter's bytes go into one `Buf`, and a
+// `Buf` moves its storage when it grows — so a pointer taken while the loop is still running is
+// dangling by the end of it, and the freed bytes are usually still the right ones, which is what
+// makes the failure silent.
+//
+// Sixty-four parameters of growing length force the scratch through several reallocations. Checked
+// by breaking `bind` on purpose -- taking the base address before the loop rather than after it
+// reddens this test, and `select $1::int + $2::int` above still passes, which is the whole reason
+// this one is here.
+@test("many parameters of many lengths all arrive intact")
+many_parameters_survive_the_buffer_growing()
+    var c = db()
+
+    var sql = str_builder()
+    var params: Buf[Param] = buf()
+    var wanted: Buf[string] = buf()
+
+    sql.push("select ")
+
+    for i in 0..<64
+        if i > 0 then sql.push(", ")
+
+        sql.push("$")
+        sql.push_int(long(i) + 1)
+        sql.push("::text")
+
+        var word = str_builder()
+
+        for j in 0..<i + 1 do word.push_int(long(i % 10))
+
+        val w = word.finish()
+
+        params.push(Param.Text(w))
+        wanted.push(w)
+
+    val rows = c.query(sql.finish(), params.view()).unwrap()
+
+    assert_eq(rows.columns(), 64, "sixty-four columns came back")
+
+    for i in 0..<rows.columns()
+        assert_eq(rows.text(0, i).unwrap(), wanted.at(i), s"parameter $i")
+
+// A NULL sitting between values is where an off-by-one in the pointer array shows up: the null
+// pointer has to land in the right slot, and the values on either side must not shift.
+@test("a NULL between values does not shift the ones around it")
+a_null_between_values()
+    var c = db()
+    val rows = c.query("select $1::text, $2::text, $3::text, $4::text",
+                       [Param.Text("one"), Param.Null, Param.Text("three"), Param.Null]).unwrap()
+
+    assert_eq(rows.text(0, 0).unwrap(), "one", "before the NULL")
+    assert_eq(rows.is_null(0, 1), true, "the NULL")
+    assert_eq(rows.text(0, 2).unwrap(), "three", "after it")
+    assert_eq(rows.is_null(0, 3), true, "and a trailing NULL")
+
+@test("an empty text parameter and an empty binary one are both legal")
+empty_parameters()
+    var c = db()
+    val nothing: []const u8 = []
+    val rows = c.query("select length($1::text), length($2::bytea)",
+                       [Param.Text(""), Param.Binary(nothing)]).unwrap()
+
+    assert_eq(rows.integer(0, 0).unwrap(), 0, "an empty string")
+    assert_eq(rows.integer(0, 1).unwrap(), 0, "an empty bytea")
+
+// -- the rest of the connection surface ---------------------------------------------------------
+
+@test("a running server reports itself up")
+health_of_a_live_server()
+    assert_eq(health(conninfo()) == Health.Up, true, "the test server is up")
+
+@test("a boolean reads the same in both wire formats")
+boolean_in_both_formats()
+    var c = db()
+
+    val text = c.query("select true, false", []).unwrap()
+
+    assert_eq(text.boolean(0, 0).unwrap(), true, "t")
+    assert_eq(text.boolean(0, 1).unwrap(), false, "f")
+
+    val binary = c.query("select true, false", [], Format.Binary).unwrap()
+
+    assert_eq(binary.bytes(0, 0).unwrap().len, 1, "one byte on the wire")
+    assert_eq(binary.boolean(0, 0).unwrap(), true, "0x01")
+    assert_eq(binary.boolean(0, 1).unwrap(), false, "0x00")
+
+@test("affected counts the rows a select returned too")
+affected_on_a_select()
+    var c = db()
+    val rows = c.query("select g from generate_series(1, 4) as g", []).unwrap()
+
+    assert_eq(rows.affected(), 4, "four rows")
+    assert_eq(rows.tag(), "SELECT 4", "the tag")
+
+@test("non-blocking mode is settable and flush completes")
+nonblocking_and_flush()
+    var c = db()
+
+    c.nonblocking(true).unwrap()
+    c.send("select 1", []).unwrap()
+
+    var more = true
+
+    while more do more = c.flush().unwrap()
+
+    var draining = true
+
+    while draining
+        c.consume().unwrap()
+
+        if !c.busy()
+            c.result().unwrap() match
+                Some(_) -> ()
+                None -> draining = false
+
+    c.nonblocking(false).unwrap()
+
+    assert_eq(c.query("select 2", []).unwrap().integer(0, 0).unwrap(), 2, "usable afterwards")
+
+@test("reset repairs a connection and leaves it usable")
+reset_repairs_a_connection()
+    var c = db()
+
+    c.query("begin", []).unwrap()
+
+    assert_eq(c.transaction() == Transaction.InTransaction, true, "a transaction is open")
+
+    c.reset()
+
+    assert_eq(c.status() == Status.Ready, true, "connected again")
+    assert_eq(c.transaction() == Transaction.Idle, true, "and the transaction is gone")
+    assert_eq(c.query("select 3", []).unwrap().integer(0, 0).unwrap(), 3, "usable")
+
+@test("an empty command is a result rather than a failure")
+an_empty_command()
+    var c = db()
+    val rows = c.query("", []).unwrap()
+
+    assert_eq(rows.rows(), 0, "nothing came back")
+
+@test("more parameters than the protocol allows is refused", should_trap)
+too_many_parameters()
+    var conn = db()
+    var params: Buf[Param] = buf()
+
+    for i in 0..<c.QUERY_PARAM_MAX_LIMIT + 1 do params.push(Param.Null)
+
+    conn.query("select 1", params.view())
+
+// -- what a value's lifetime is -----------------------------------------------------------------
+
+// `text()` copies and `bytes()` borrows, and this is the half of that claim which can be asserted:
+// the string is read inside a function, the `Rows` is dropped when that function returns, and the
+// value is checked afterwards with a hundred thousand bytes of churn in between. Under
+// AddressSanitizer a `text()` that had merely pointed into the result would report a
+// heap-use-after-free here.
+@test("a string read out of a result outlives the result")
+text_outlives_the_result()
+    val kept = harvested()
+
+    var churn: Buf[u8] = buf()
+
+    for i in 0..<100000 do churn.push(u8(i % 256))
+
+    assert_eq(kept, "outlives its row set", "the copy survived its Rows")
+
+private harvested() -> string
+    var c = db()
+    val rows = c.query("select 'outlives its row set'::text", []).unwrap()
+
+    rows.text(0, 0).unwrap()
+
+// -- what a destructor is for -------------------------------------------------------------------
+
+// **`Connection` and `Rows` are returned as `&T` so that their destructors run**, and this is the
+// test that says so. A `Drop` runs when a *box's* count reaches zero; a plain struct value is
+// copied rather than owned, so its destructor is never called at all -- which means a `Connection`
+// returned by value would keep its backend open for the life of the program and nothing would look
+// wrong until the hundredth one.
+//
+// PostgreSQL's `max_connections` defaults to 100, so a hundred and fifty connections that are
+// actually closed is fine and a hundred and fifty that are not is refused by the server. That is
+// what makes this checkable without measuring memory.
+@test("a connection that goes out of scope is closed")
+connections_are_closed_when_they_go()
+    for i in 0..<150
+        var c = db()
+
+        assert_eq(c.status() == Status.Ready, true, s"connection $i")

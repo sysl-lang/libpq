@@ -1,0 +1,242 @@
+/** libpq as C declares it -- every name here is a symbol in `libpq.dylib`, and there is no C of our
+ * own anywhere in this package.
+ *
+ * **The survey found nothing to shim**, which is unusual enough to be worth writing down. The three
+ * shapes only C can reach are a caller-allocated opaque type, a macro standing in for a symbol, and
+ * a shape with no sysl spelling; libpq has none of them in the surface a client uses:
+ *
+ *   - `PGconn`, `PGresult` and `PGcancel` are allocated *by the library* -- `PQconnectdb` and
+ *     `PQexecParams` return them and `PQfinish`/`PQclear` free them, so nothing here has to know
+ *     how big one is.
+ *   - `libpq-fe.h` declares no `static inline` at all, and its only two function-like macros are
+ *     `PQsetdb` (a deprecated spelling of `PQsetdbLogin`) and `PQfreeNotify` (a spelling of
+ *     `PQfreemem`). Neither is needed.
+ *   - The parameters go in as `char * const *` and the values come back as `char *`, which are
+ *     `**u8` and `*u8`.
+ *
+ * `PGnotify` is the one struct a caller reads through, and it is declared here field for field --
+ * its own comment in the header says it would be opaque if it were not so simple. The `next` field
+ * is libqp's list link and is named only so that the layout is right.
+ *
+ * **Nothing in this module is meant to be called by a program.** `sh.sysl.postgres` is the module
+ * to import; this one is what it is written against.
+ */
+module sh.sysl.postgres.c
+
+@include("libpq-fe.h")
+@include("postgres_ext.h")
+@include("stddef.h")
+
+/** A connection. Allocated by `PQconnectdb` or `PQconnectStart`, freed by `PQfinish`, and valid
+ * even when the connection failed -- which is how the failure is read.
+ */
+opaque struct Conn
+
+/** The result of one command. Allocated by `PQexecParams` or `PQgetResult`, freed by `PQclear`.
+ * Every `char *` a caller reads out of one points *into* it and dies with it.
+ */
+opaque struct Result
+
+/** The token that lets another thread cancel a query. Allocated by `PQgetCancel`, freed by
+ * `PQfreeCancel`, and deliberately separate from the `Conn` so that cancelling is safe.
+ */
+opaque struct Cancel
+
+/** An asynchronous notification, as `PQnotifies` hands it back. The storage is libpq's and is
+ * released with `PQfreemem`; this package copies the two strings out before it does.
+ */
+struct Notify
+    relname: *u8
+    be_pid: i32
+    extra: *u8
+    next: *Notify
+
+@needs(posix)
+extern "PQconnectdb" connectdb(conninfo: *u8) -> *Conn
+
+@needs(posix)
+extern "PQconnectStart" connect_start(conninfo: *u8) -> *Conn
+
+@needs(posix)
+extern "PQconnectPoll" connect_poll(conn: *Conn) -> i32
+
+@needs(posix)
+extern "PQping" ping(conninfo: *u8) -> i32
+
+extern "PQstatus" status(conn: *Conn) -> i32
+
+extern "PQtransactionStatus" transaction_status(conn: *Conn) -> i32
+
+@needs(posix)
+extern "PQfinish" finish(conn: *Conn)
+
+@needs(posix)
+extern "PQreset" reset(conn: *Conn)
+
+extern "PQerrorMessage" error_message(conn: *Conn) -> *u8
+
+extern "PQsocket" socket(conn: *Conn) -> i32
+
+extern "PQserverVersion" server_version(conn: *Conn) -> i32
+
+extern "PQdb" db(conn: *Conn) -> *u8
+
+extern "PQuser" user(conn: *Conn) -> *u8
+
+extern "PQhost" host(conn: *Conn) -> *u8
+
+extern "PQport" port(conn: *Conn) -> *u8
+
+extern "PQsetnonblocking" set_nonblocking(conn: *Conn, arg: i32) -> i32
+
+extern "PQisnonblocking" is_nonblocking(conn: *Conn) -> i32
+
+@needs(posix)
+extern "PQflush" flush(conn: *Conn) -> i32
+
+/** The parameterised exec, and the only one this package binds. `PQexec` takes a whole SQL string
+ * and nothing else, which is the shape an injection is written in; there is no reason to offer it.
+ */
+@needs(posix)
+extern "PQexecParams" exec_params(conn: *Conn, command: *u8, n_params: i32,
+                                          param_types: *u32, param_values: **u8,
+                                          param_lengths: *i32, param_formats: *i32,
+                                          result_format: i32) -> *Result
+
+@needs(posix)
+extern "PQsendQueryParams" send_query_params(conn: *Conn, command: *u8, n_params: i32,
+                                                     param_types: *u32, param_values: **u8,
+                                                     param_lengths: *i32, param_formats: *i32,
+                                                     result_format: i32) -> i32
+
+@needs(posix)
+extern "PQconsumeInput" consume_input(conn: *Conn) -> i32
+
+extern "PQisBusy" is_busy(conn: *Conn) -> i32
+
+@needs(posix)
+extern "PQgetResult" get_result(conn: *Conn) -> *Result
+
+extern "PQsetSingleRowMode" set_single_row_mode(conn: *Conn) -> i32
+
+@needs(posix)
+extern "PQnotifies" notifies(conn: *Conn) -> *Notify
+
+@needs(heap)
+extern "PQgetCancel" get_cancel(conn: *Conn) -> *Cancel
+
+extern "PQfreeCancel" free_cancel(cancel: *Cancel)
+
+@needs(posix)
+extern "PQcancel" cancel(cancel: *Cancel, errbuf: *u8, errbufsize: i32) -> i32
+
+extern "PQresultStatus" result_status(res: *Result) -> i32
+
+extern "PQresStatus" res_status(status: i32) -> *u8
+
+extern "PQresultErrorMessage" result_error_message(res: *Result) -> *u8
+
+extern "PQresultErrorField" result_error_field(res: *Result, fieldcode: i32) -> *u8
+
+extern "PQntuples" ntuples(res: *Result) -> i32
+
+extern "PQnfields" nfields(res: *Result) -> i32
+
+extern "PQfname" fname(res: *Result, field_num: i32) -> *u8
+
+extern "PQfnumber" fnumber(res: *Result, field_name: *u8) -> i32
+
+extern "PQftype" ftype(res: *Result, field_num: i32) -> u32
+
+extern "PQfformat" fformat(res: *Result, field_num: i32) -> i32
+
+extern "PQgetvalue" getvalue(res: *Result, tup_num: i32, field_num: i32) -> *u8
+
+extern "PQgetlength" getlength(res: *Result, tup_num: i32, field_num: i32) -> i32
+
+extern "PQgetisnull" getisnull(res: *Result, tup_num: i32, field_num: i32) -> i32
+
+extern "PQcmdStatus" cmd_status(res: *Result) -> *u8
+
+extern "PQcmdTuples" cmd_tuples(res: *Result) -> *u8
+
+extern "PQclear" clear(res: *Result)
+
+@needs(heap)
+extern "PQescapeIdentifier" escape_identifier(conn: *Conn, str: *u8, len: usize) -> *u8
+
+extern "PQfreemem" freemem(ptr: *u8)
+
+/** `ConnStatusType`. Only the first two are documented as reliable -- the header says outright that
+ * the existence of the rest should never be relied upon -- so the pleasant layer reads exactly
+ * those two and treats everything else as "still working on it".
+ */
+c const
+    CONNECTION_OK:  i32 = "CONNECTION_OK"
+    CONNECTION_BAD: i32 = "CONNECTION_BAD"
+
+/** `PostgresPollingStatusType`, which is the whole of the asynchronous connect state machine. */
+c const
+    POLLING_FAILED:  i32 = "PGRES_POLLING_FAILED"
+    POLLING_READING: i32 = "PGRES_POLLING_READING"
+    POLLING_WRITING: i32 = "PGRES_POLLING_WRITING"
+    POLLING_OK:      i32 = "PGRES_POLLING_OK"
+
+/** `ExecStatusType`. `PGRES_TUPLES_OK` and `PGRES_COMMAND_OK` are the two successes; the two error
+ * values are what the pleasant layer turns into a `Failed`.
+ */
+c const
+    EMPTY_QUERY:     i32 = "PGRES_EMPTY_QUERY"
+    COMMAND_OK:      i32 = "PGRES_COMMAND_OK"
+    TUPLES_OK:       i32 = "PGRES_TUPLES_OK"
+    COPY_OUT:        i32 = "PGRES_COPY_OUT"
+    COPY_IN:         i32 = "PGRES_COPY_IN"
+    BAD_RESPONSE:    i32 = "PGRES_BAD_RESPONSE"
+    NONFATAL_ERROR:  i32 = "PGRES_NONFATAL_ERROR"
+    FATAL_ERROR:     i32 = "PGRES_FATAL_ERROR"
+    COPY_BOTH:       i32 = "PGRES_COPY_BOTH"
+    SINGLE_TUPLE:    i32 = "PGRES_SINGLE_TUPLE"
+
+/** `PGTransactionStatusType`. */
+c const
+    TRANS_IDLE:    i32 = "PQTRANS_IDLE"
+    TRANS_ACTIVE:  i32 = "PQTRANS_ACTIVE"
+    TRANS_INTRANS: i32 = "PQTRANS_INTRANS"
+    TRANS_INERROR: i32 = "PQTRANS_INERROR"
+    TRANS_UNKNOWN: i32 = "PQTRANS_UNKNOWN"
+
+/** `PGPing`, as `PQping` answers it. */
+c const
+    PING_OK:          i32 = "PQPING_OK"
+    PING_REJECT:      i32 = "PQPING_REJECT"
+    PING_NO_RESPONSE: i32 = "PQPING_NO_RESPONSE"
+    PING_NO_ATTEMPT:  i32 = "PQPING_NO_ATTEMPT"
+
+/** The diagnostic field codes, which are `char` literals rather than numbers in `postgres_ext.h`.
+ * `SQLSTATE` is the one worth matching on: five characters, defined by the standard and by
+ * PostgreSQL's Appendix A, and stable across versions and locales in a way the message text is not.
+ */
+c const
+    DIAG_SEVERITY:        i32 = "PG_DIAG_SEVERITY"
+    DIAG_SQLSTATE:        i32 = "PG_DIAG_SQLSTATE"
+    DIAG_MESSAGE_PRIMARY: i32 = "PG_DIAG_MESSAGE_PRIMARY"
+    DIAG_MESSAGE_DETAIL:  i32 = "PG_DIAG_MESSAGE_DETAIL"
+    DIAG_MESSAGE_HINT:    i32 = "PG_DIAG_MESSAGE_HINT"
+    DIAG_CONSTRAINT_NAME: i32 = "PG_DIAG_CONSTRAINT_NAME"
+    DIAG_TABLE_NAME:      i32 = "PG_DIAG_TABLE_NAME"
+    DIAG_COLUMN_NAME:     i32 = "PG_DIAG_COLUMN_NAME"
+
+/** The limit the protocol puts on one command's parameters, which is a `#define` rather than
+ * anything a call reports. Exceeding it is refused by the server rather than by libpq.
+ */
+c const
+    QUERY_PARAM_MAX_LIMIT: usize = "PQ_QUERY_PARAM_MAX_LIMIT"
+
+/** `sizeof` and `offsetof` over `PGnotify`, so that a version of libpq which reordered or grew the
+ * struct fails a test here rather than reading the wrong field at run time.
+ */
+c const
+    NOTIFY_SIZE:    usize = "sizeof(PGnotify)"
+    NOTIFY_RELNAME: usize = "offsetof(PGnotify, relname)"
+    NOTIFY_BE_PID:  usize = "offsetof(PGnotify, be_pid)"
+    NOTIFY_EXTRA:   usize = "offsetof(PGnotify, extra)"

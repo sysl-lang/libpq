@@ -1,0 +1,762 @@
+// PostgreSQL for sysl.
+//
+//     var db = connect("host=127.0.0.1 dbname=shop user=app")?
+//
+//     val rows = db.query("select id, email from users where age > $1", [Text("21")])?
+//
+//     for r in 0..<rows.rows()
+//         print(s"${rows.integer(r, 0)} ${rows.text(r, 1)}")
+//
+// ## Every value goes out of band, and there is no other way to write a query
+//
+// `PQexec` is not bound. It takes a command string and nothing else, which is the shape an
+// injection is written in, and offering it beside the safe call would make the unsafe one the
+// convenient one. What is here is `PQexecParams` and `PQsendQueryParams`: the SQL carries `$1`,
+// `$2`, `$3`, the values travel beside it, and the server never parses a value as syntax.
+//
+// **An identifier is the one thing a parameter cannot be.** `select * from $1` is not legal SQL, so
+// a program that has to name a table it was told about at run time uses `identifier()`, which is
+// libpq's own quoting and not a string built here.
+//
+// ## The asynchronous half is bound, because a server needs it
+//
+// `PQexec` blocks the thread until the server answers, which in a program serving more than one
+// request at a time is the whole thread. The other road is a state machine over a file descriptor:
+//
+//     var db = connect_start("host=127.0.0.1 dbname=shop")?
+//
+//     while db.poll() match          // select() or a libuv poll handle on db.socket() between turns
+//         Poll.Reading -> true
+//         Poll.Writing -> true
+//         Poll.Ready   -> false
+//         Poll.Failed  -> return Err(...)
+//         do ()
+//
+//     db.send("select 1", [])?
+//
+//     // then, whenever the socket is readable:
+//     db.consume()?
+//     if !db.busy()
+//         while db.result()? match
+//             Some(rows) -> ...
+//             None -> false
+//
+// **`result()` must be drained to `None`.** libpq answers one `PGresult` per command in the string
+// and then a null to say the command is finished; a caller that stops at the first result leaves the
+// connection unusable for the next one. That is libpq's rule rather than this package's, and it is
+// the one thing about the asynchronous path that is easy to get wrong.
+//
+// ## What a value is
+//
+// `bytes()` hands back a slice pointing *into* the result, which dies with the `Rows`. `text()`
+// copies. The split is deliberate: a row set can be large and the borrow is what makes reading one
+// free, but a `string` that outlives its `Rows` would be a use-after-free that prints correctly
+// until the memory is reused.
+//
+// **`None` means SQL NULL.** It is not an empty string, and `is_null()` is what distinguishes them
+// where the difference matters -- `PQgetvalue` answers an empty string for both.
+
+module sh.sysl.postgres
+
+import sh.sysl.postgres.c
+import sysl.buf.{Buf, buf, buf_with_capacity}
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.text.{cstring, from_cstring, from_utf8_unchecked, parse_long, parse_real, parse_ulong}
+
+/** What went wrong. **`Failed` is the server refusing a command and everything else is the
+ * connection**, which is the division a caller acts on: a `Failed` is answered by fixing the
+ * statement or the data, and the rest by reconnecting.
+ */
+enum Error
+    /** The connection could not be made, or is no longer usable. Carries `PQerrorMessage`. */
+    Connect(why: string)
+    /** The server refused the command. `state` is the five-character SQLSTATE, which is what to
+     * match on -- the message is localised and the wording moves between versions.
+     */
+    Failed(state: string, why: string)
+    /** libpq would not send. In blocking mode this is a dead connection; in non-blocking mode it can
+     * also mean the outbound buffer is full and `flush()` has not been run.
+     */
+    Send(why: string)
+    /** libpq could not allocate. It reports this by answering a null pointer with no message. */
+    NoMemory
+end Error
+
+/** The SQLSTATE codes worth naming, from PostgreSQL's Appendix A. They are strings rather than an
+ * enum because the set is open -- an extension defines its own -- and because comparing against the
+ * five characters the server actually sent is what a caller wants to be able to do.
+ */
+const unique_violation:      string = "23505"
+const foreign_key_violation: string = "23503"
+const not_null_violation:    string = "23502"
+const check_violation:       string = "23514"
+const serialization_failure: string = "40001"
+const deadlock_detected:     string = "40P01"
+const undefined_table:       string = "42P01"
+const undefined_column:      string = "42703"
+const syntax_error:          string = "42601"
+const insufficient_privilege: string = "42501"
+
+/** One value going out to the server. */
+enum Param
+    /** SQL NULL. Distinct from `Text("")`, which is an empty string. */
+    Null
+    /** Text format -- the ordinary case, and what every PostgreSQL type accepts on input. A number
+     * goes out as `Text("42")` and the server reads it as whatever the column is.
+     */
+    Text(s: string)
+    /** Binary format, for a `bytea` column. The bytes go out exactly as given; anything else would
+     * need the type's binary wire format, which is a per-type question this package does not answer.
+     */
+    Binary(bytes: []const u8)
+end Param
+
+/** Which format the server sends results back in. */
+enum Format
+    /** Every column arrives as text, whatever its type. This is what `text()`, `integer()` and the
+     * rest read, and it is the default.
+     */
+    Text
+    /** Every column arrives in PostgreSQL's binary wire format -- all of them or none, which is
+     * libpq's rule rather than this package's. `bytes()` then has the raw bytes and the decoding is
+     * the caller's: an `int4` is four bytes big-endian, a `bytea` is itself.
+     *
+     * **It is one integer rather than a second code path**, which is why it is offered at all. The
+     * ordinary reason to reach for it is a large `bytea`, and `bytea()` in text mode covers that
+     * without it.
+     */
+    Binary
+end Format
+
+/** Where an asynchronous connect has got to. */
+enum Poll
+    /** Wait for the socket to be readable, then poll again. */
+    Reading
+    /** Wait for the socket to be writable, then poll again. */
+    Writing
+    /** Connected. */
+    Ready
+    /** It will not connect; `error()` says why. */
+    Failed
+end Poll
+
+/** Whether the connection is usable. The header says outright that the intermediate states "should
+ * never be relied upon", so this reads the two that may be and calls the rest `Connecting`.
+ *
+ * **`Ready` rather than `Ok`**, which is the word libpq uses: a variant named `Ok` declared in a
+ * module shadows `Result.Ok` throughout it, so every `Ok(…)` in this file would stop compiling.
+ */
+enum Status
+    Ready
+    Bad
+    Connecting
+end Status
+
+/** Whether a transaction is open, which is the one piece of connection state a pool has to check
+ * before handing a connection to somebody else.
+ */
+enum Transaction
+    Idle
+    Active
+    InTransaction
+    InError
+    Unknown
+end Transaction
+
+/** Whether a server is up, without connecting to it. */
+enum Health
+    Up
+    Refusing
+    Silent
+    NotAttempted
+end Health
+
+/** An asynchronous notification, as `LISTEN`/`NOTIFY` delivers it. The strings are copied out of
+ * libpq's storage, so this value outlives the connection.
+ */
+struct Notification
+    channel: string
+    pid: i32
+    payload: string
+end Notification
+
+// ---------------------------------------------------------------------------------------------
+// Rows
+// ---------------------------------------------------------------------------------------------
+
+/** The answer to one command. **It owns the `PGresult`**, so every slice `bytes()` hands out dies
+ * with it -- and so does anything `from_utf8_unchecked` was pointed at. `text()` copies for exactly
+ * that reason.
+ */
+struct Rows
+    private handle: *c.Result
+
+    /** How many rows came back. A command that returns nothing answers zero. */
+    rows(self) -> usize = usize(c.ntuples(self.handle))
+
+    /** How many columns. */
+    columns(self) -> usize = usize(c.nfields(self.handle))
+
+    /** A column's name, as the server spelled it. */
+    name(self, col: usize) -> string
+        require col < self.columns(), "column out of range"
+
+        from_cstring(c.fname(self.handle, i32(col))).unwrap_or("")
+    end name
+
+    /** The index of a column by name, or `None` when the result has no such column. The comparison
+     * is the server's: an identifier that was not quoted arrives folded to lower case.
+     */
+    column(self, name: string) -> Option[usize]
+        val cs = cstring(name)
+        val n = c.fnumber(self.handle, cs.ptr)
+
+        if n < 0 then None else Some(usize(n))
+    end column
+
+    /** The column's PostgreSQL type OID -- 23 for `int4`, 25 for `text`, 17 for `bytea`. Worth
+     * having when a program reads a result it did not write the query for.
+     */
+    type_of(self, col: usize) -> u32
+        require col < self.columns(), "column out of range"
+
+        c.ftype(self.handle, i32(col))
+    end type_of
+
+    /** Whether this cell is SQL NULL. **`PQgetvalue` cannot tell you** -- it answers an empty string
+     * for a NULL and for an empty string alike, which is why this call exists.
+     */
+    is_null(self, row: usize, col: usize) -> bool
+        require row < self.rows(), "row out of range"
+        require col < self.columns(), "column out of range"
+
+        c.getisnull(self.handle, i32(row), i32(col)) != 0
+    end is_null
+
+    /** The cell's bytes, **borrowed from the result**. `None` is SQL NULL.
+     *
+     * The slice points into storage this `Rows` owns and is freed with it. Where the value has to
+     * outlive the row set, `text()` copies.
+     */
+    bytes(self, row: usize, col: usize) -> Option[[]const u8]
+        require row < self.rows(), "row out of range"
+        require col < self.columns(), "column out of range"
+
+        if c.getisnull(self.handle, i32(row), i32(col)) != 0 then return None
+
+        val n = usize(c.getlength(self.handle, i32(row), i32(col)))
+        val p = c.getvalue(self.handle, i32(row), i32(col))
+
+        Some(p[0..<n])
+    end bytes
+
+    /** The cell as text, **copied**, so it outlives the row set. `None` is SQL NULL.
+     *
+     * The bytes are not checked for UTF-8. PostgreSQL validates against the database encoding on the
+     * way in, so a `UTF8` database cannot hold anything else; a `SQL_ASCII` one can hold any bytes at
+     * all, and there `bytes()` is the honest call.
+     */
+    text(self, row: usize, col: usize) -> Option[string]
+        self.bytes(row, col) match
+            Some(b) -> Some(copied(b))
+            None -> None
+    end text
+
+    /** The cell read as an integer. `None` when the cell is NULL **or does not hold one** -- use
+     * `text()` where the two have to be told apart.
+     */
+    integer(self, row: usize, col: usize) -> Option[long]
+        self.bytes(row, col) match
+            Some(b) -> parse_long(b).ok()
+            None -> None
+    end integer
+
+    /** The cell read as a floating-point number, by the same rule as `integer`. */
+    number(self, row: usize, col: usize) -> Option[real]
+        self.bytes(row, col) match
+            Some(b) -> parse_real(b).ok()
+            None -> None
+    end number
+
+    /** The cell read as a boolean.
+     *
+     * PostgreSQL sends `t` and `f` in text format, which is neither spelling
+     * `sysl.text.parse_bool` takes, and a single `0x00` or `0x01` byte in binary format. Both are
+     * read, and they cannot be confused: `t` is `0x74`.
+     */
+    boolean(self, row: usize, col: usize) -> Option[bool]
+        self.bytes(row, col) match
+            Some(b) -> truth(b)
+            None -> None
+    end boolean
+
+    /** A `bytea` column, decoded from the `\x…` hexadecimal form PostgreSQL sends in text format.
+     * `None` is NULL; a value that is not in that form answers `None` too.
+     *
+     * **This is why `Format.Binary` is rarely worth reaching for.** In binary format the same column
+     * arrives as itself and `bytes()` has it directly -- at the cost of every other column in the
+     * result arriving in binary as well.
+     */
+    bytea(self, row: usize, col: usize) -> Option[Buf[u8]]
+        self.bytes(row, col) match
+            Some(b) -> unhex(b)
+            None -> None
+    end bytea
+
+    /** The command tag, as `INSERT 0 1` or `SELECT 3`. */
+    tag(self) -> string = from_cstring(c.cmd_status(self.handle)).unwrap_or("")
+
+    /** How many rows the command touched, which for an `INSERT`, `UPDATE` or `DELETE` is the number
+     * that matters and for a `SELECT` is the same as `rows()`.
+     */
+    affected(self) -> usize
+        val s = c.cmd_tuples(self.handle)
+
+        from_cstring(s) match
+            Ok(t) -> parse_ulong(t).map((n) -> usize(n)).unwrap_or(0)
+            Err(_) -> 0
+    end affected
+end Rows
+
+impl Drop for Rows
+    drop(self) = c.clear(self.handle)
+
+// ---------------------------------------------------------------------------------------------
+// Connection
+// ---------------------------------------------------------------------------------------------
+
+/** A connection to a server. Closed when it goes out of scope. */
+struct Connection
+    private handle: *c.Conn
+
+    /** Whether the connection is usable. */
+    status(self) -> Status
+        val s = c.status(self.handle)
+
+        var out = Status.Connecting
+
+        if s == c.CONNECTION_OK then out = Status.Ready
+        if s == c.CONNECTION_BAD then out = Status.Bad
+
+        out
+    end status
+
+    /** Whatever libpq last had to say about this connection. Empty when nothing went wrong. */
+    error(self) -> string = from_cstring(c.error_message(self.handle)).unwrap_or("")
+
+    /** The socket, for a `select` loop or a `libuv` poll handle. Negative when there is none. */
+    socket(self) -> i32 = c.socket(self.handle)
+
+    /** The server's version as a number -- 160014 is 16.14. Zero when it is not known yet. */
+    server_version(self) -> i32 = c.server_version(self.handle)
+
+    /** The database this connection is to. */
+    database(self) -> string = from_cstring(c.db(self.handle)).unwrap_or("")
+
+    /** The user it connected as. */
+    user(self) -> string = from_cstring(c.user(self.handle)).unwrap_or("")
+
+    /** Whether a transaction is open. */
+    transaction(self) -> Transaction
+        val t = c.transaction_status(self.handle)
+
+        var out = Transaction.Unknown
+
+        if t == c.TRANS_IDLE then out = Transaction.Idle
+        if t == c.TRANS_ACTIVE then out = Transaction.Active
+        if t == c.TRANS_INTRANS then out = Transaction.InTransaction
+        if t == c.TRANS_INERROR then out = Transaction.InError
+
+        out
+    end transaction
+
+    /** Drive an asynchronous connect one step. Start with `connect_start`, then poll whenever the
+     * socket is ready in the direction the last answer named.
+     *
+     * **Do not call `socket()` before the first `poll()`** -- libpq's own documentation says the
+     * descriptor may change during the handshake, so read it again after each answer.
+     */
+    poll(*self) -> Poll
+        val p = c.connect_poll(self.handle)
+
+        var out = Poll.Failed
+
+        if p == c.POLLING_READING then out = Poll.Reading
+        if p == c.POLLING_WRITING then out = Poll.Writing
+        if p == c.POLLING_OK then out = Poll.Ready
+
+        out
+    end poll
+
+    /** Reconnect, reusing the same parameters. A connection that has gone bad is repaired by this
+     * and by nothing else; every open transaction and prepared statement is gone.
+     */
+    reset(*self) = c.reset(self.handle)
+
+    /** Put the connection into non-blocking mode, which is what the asynchronous path needs -- in
+     * blocking mode `send` waits for the whole command to go out.
+     */
+    nonblocking(*self, on: bool) -> Result[unit, Error]
+        if c.set_nonblocking(self.handle, if on then 1 else 0) != 0
+            return Err(Error.Send(self.error()))
+
+        Ok(())
+    end nonblocking
+
+    /** Push whatever is still queued towards the server. `Ok(true)` means there is more left and the
+     * socket is not writable yet; `Ok(false)` means it has all gone.
+     */
+    flush(*self) -> Result[bool, Error]
+        val n = c.flush(self.handle)
+
+        if n < 0 then return Err(Error.Send(self.error()))
+
+        Ok(n == 1)
+    end flush
+
+    /** Run one command and wait for its answer.
+     *
+     * The SQL carries `$1`, `$2` and so on; `params` holds their values in order. An empty `params`
+     * is fine and still goes through the parameterised path.
+     */
+    query(*self, sql: string, params: []const Param, format: Format = Format.Text) -> Result[&Rows, Error]
+        require params.len <= c.QUERY_PARAM_MAX_LIMIT, "too many parameters for one command"
+
+        val command = cstring(sql)
+        var bound = bind(params)
+
+        val res = c.exec_params(self.handle, command.ptr, i32(params.len), null,
+                                bound.pointers(), bound.sizes(), bound.kinds(), wire(format))
+
+        judge(res, self.handle)
+    end query
+
+    /** Send a command without waiting for its answer. Pairs with `consume`, `busy` and `result`.
+     *
+     * In non-blocking mode this can return before the command has gone out; `flush` is what finishes
+     * it. In blocking mode it returns once the whole command is written.
+     */
+    send(*self, sql: string, params: []const Param, format: Format = Format.Text) -> Result[unit, Error]
+        require params.len <= c.QUERY_PARAM_MAX_LIMIT, "too many parameters for one command"
+
+        val command = cstring(sql)
+        var bound = bind(params)
+
+        val ok = c.send_query_params(self.handle, command.ptr, i32(params.len), null,
+                                     bound.pointers(), bound.sizes(), bound.kinds(), wire(format))
+
+        if ok == 0 then return Err(Error.Send(self.error()))
+
+        Ok(())
+    end send
+
+    /** Read whatever has arrived on the socket into libpq's buffer. Run this when the socket is
+     * readable, before asking `busy`.
+     */
+    consume(*self) -> Result[unit, Error]
+        if c.consume_input(self.handle) == 0 then return Err(Error.Connect(self.error()))
+
+        Ok(())
+    end consume
+
+    /** Whether a whole result has yet to arrive. **While this is true, `result` would block**, which
+     * is the one thing the asynchronous path exists to avoid.
+     */
+    busy(self) -> bool = c.is_busy(self.handle) != 0
+
+    /** The next result of the command in flight, or `None` when it has no more.
+     *
+     * **Drain it to `None`.** libpq answers one result per command in the string and then a null to
+     * say the command is over; a connection whose last result was never collected refuses the next
+     * command. On an `Err` the same applies -- keep calling until `Ok(None)`.
+     */
+    result(*self) -> Result[Option[&Rows], Error]
+        val res = c.get_result(self.handle)
+
+        if usize(res) == 0 then return Ok(None)
+
+        judge(res, self.handle).map((rows) -> Some(rows))
+    end result
+
+    /** Ask for the rows of the command in flight one at a time, rather than waiting for the whole
+     * result to be buffered. Run it after `send` and before the first `result`.
+     *
+     * Each `result` then answers a `Rows` holding a single row, and the last one before `None` holds
+     * none at all and carries the command tag.
+     */
+    single_row_mode(*self) -> Result[unit, Error]
+        if c.set_single_row_mode(self.handle) == 0 then return Err(Error.Send(self.error()))
+
+        Ok(())
+    end single_row_mode
+
+    /** The next `NOTIFY` that has arrived, or `None`. **Notifications are collected by `consume` and
+     * by any query**, so a program that only listens still has to call `consume` to hear anything.
+     */
+    notification(*self) -> Option[Notification]
+        val n = c.notifies(self.handle)
+
+        if usize(n) == 0 then return None
+
+        val note = Notification(from_cstring((*n).relname).unwrap_or(""), (*n).be_pid,
+                                from_cstring((*n).extra).unwrap_or(""))
+
+        c.freemem(ptr_cast(n))
+
+        Some(note)
+    end notification
+
+    /** Ask the server to abandon whatever this connection is running.
+     *
+     * **It is a request rather than a guarantee**: `Ok` means the cancel was delivered, not that the
+     * query stopped. The command in flight still has to be drained afterwards, and it may well
+     * succeed -- or fail with `57014`, which is what a cancel that landed looks like.
+     */
+    cancel(self) -> Result[unit, Error]
+        val token = c.get_cancel(self.handle)
+
+        if usize(token) == 0 then return Err(Error.Connect("no connection to cancel"))
+
+        var message: [256]u8 = [0; 256]
+        val ok = c.cancel(token, &message[0], 256)
+
+        c.free_cancel(token)
+
+        if ok == 1 then return Ok(())
+
+        Err(Error.Connect(from_cstring(&message[0]).unwrap_or("cancel failed")))
+    end cancel
+
+    /** A name quoted so that it can be written into SQL where a parameter is not allowed -- a table,
+     * a column, a schema. **This is libpq's own quoting**, which knows the server's encoding and its
+     * `standard_conforming_strings` setting; nothing here builds the string.
+     *
+     * It is still the caller's job to have decided the name is one the program is willing to name.
+     * Quoting makes `users; drop table x` a table called `users; drop table x`, which is safe and
+     * is not what anybody meant.
+     */
+    identifier(self, name: string) -> Result[string, Error]
+        val cs = cstring(name)
+        val p = c.escape_identifier(self.handle, cs.ptr, cs.len)
+
+        if usize(p) == 0 then return Err(Error.Connect(self.error()))
+
+        val out = from_cstring(p).unwrap_or("")
+
+        c.freemem(p)
+
+        Ok(out)
+    end identifier
+end Connection
+
+impl Drop for Connection
+    drop(self) = c.finish(self.handle)
+
+// ---------------------------------------------------------------------------------------------
+// Connecting
+// ---------------------------------------------------------------------------------------------
+
+/** Connect, and wait until it is done.
+ *
+ * `conninfo` is libpq's own keyword string -- `host=… port=… dbname=… user=… password=… sslmode=…`
+ * -- or a URI, `postgresql://user@host/db`. An empty string is legal and means every setting comes
+ * from the environment, which is how `PGHOST` and friends are meant to be used.
+ */
+connect(conninfo: string) -> Result[&Connection, Error]
+    val cs = cstring(conninfo)
+    val handle = c.connectdb(cs.ptr)
+
+    if usize(handle) == 0 then return Err(Error.NoMemory)
+
+    if c.status(handle) != c.CONNECTION_OK
+        // **Nothing owns the handle on this path.** A failed connect still hands back a `PGconn`,
+        // which is how libpq reports what went wrong — and a `Connection` built to read it would be
+        // a plain value rather than a box, so its destructor would never run. Read the message, then
+        // close it here.
+        val why = from_cstring(c.error_message(handle)).unwrap_or("")
+
+        c.finish(handle)
+
+        return Err(Error.Connect(why))
+
+    Ok(Connection(handle))
+end connect
+
+/** Start connecting and return at once. The connection is not usable until `poll()` has answered
+ * `Poll.Ready`; until then only `poll`, `socket` and `error` mean anything.
+ */
+connect_start(conninfo: string) -> Result[&Connection, Error]
+    val cs = cstring(conninfo)
+    val handle = c.connect_start(cs.ptr)
+
+    if usize(handle) == 0 then return Err(Error.NoMemory)
+
+    if c.status(handle) == c.CONNECTION_BAD
+        val why = from_cstring(c.error_message(handle)).unwrap_or("")
+
+        c.finish(handle)
+
+        return Err(Error.Connect(why))
+
+    Ok(Connection(handle))
+end connect_start
+
+/** Whether a server is accepting connections, without making one. This is what `pg_isready` runs,
+ * and it is the call for a health check -- it costs no session on the server.
+ */
+health(conninfo: string) -> Health
+    val cs = cstring(conninfo)
+    val p = c.ping(cs.ptr)
+
+    var out = Health.NotAttempted
+
+    if p == c.PING_OK then out = Health.Up
+    if p == c.PING_REJECT then out = Health.Refusing
+    if p == c.PING_NO_RESPONSE then out = Health.Silent
+
+    out
+end health
+
+// ---------------------------------------------------------------------------------------------
+// The parts a caller does not see
+// ---------------------------------------------------------------------------------------------
+
+/** Every parameter's bytes, in one allocation, with the pointers computed only after the last of
+ * them has been written.
+ *
+ * **That order is the whole point.** A `Buf` moves its storage when it grows, so a pointer taken
+ * during the loop is dangling by the end of it -- and the failure is silent, because the freed
+ * bytes are usually still the ones that were there. Offsets survive the move; pointers do not.
+ */
+private struct Bound
+    private scratch: Buf[u8]
+    private offsets: Buf[usize]
+    private lengths: Buf[i32]
+    private formats: Buf[i32]
+    private values: Buf[*u8]
+
+    private pointers(*self) -> **u8 = as_mut_ptr(self.values.view())
+
+    private sizes(*self) -> *i32 = as_mut_ptr(self.lengths.view())
+
+    private kinds(*self) -> *i32 = as_mut_ptr(self.formats.view())
+end Bound
+
+private const absent: usize = 18446744073709551615
+
+private bind(params: []const Param) -> Bound
+    var b = Bound(buf(), buf(), buf(), buf(), buf())
+
+    for p in params
+        p match
+            Param.Null ->
+                b.offsets.push(absent)
+                b.lengths.push(0)
+                b.formats.push(0)
+            Param.Text(s) ->
+                b.offsets.push(b.scratch.len())
+                b.scratch.extend(s.bytes)
+                b.scratch.push(0)
+                b.lengths.push(i32(s.bytes.len))
+                b.formats.push(0)
+            Param.Binary(xs) ->
+                b.offsets.push(b.scratch.len())
+                b.scratch.extend(xs)
+                b.scratch.push(0)
+                b.lengths.push(i32(xs.len))
+                b.formats.push(1)
+
+    val base = usize(as_mut_ptr(b.scratch.view()))
+
+    for off in b.offsets.view()
+        b.values.push(if off == absent then null else ptr_cast(base + off))
+
+    b
+end bind
+
+private wire(f: Format) -> i32 = f match
+    Format.Text -> 0
+    Format.Binary -> 1
+
+/** Turn a `PGresult` into either a `Rows` that owns it or an `Error` that has read it. A null
+ * result is libpq out of memory, which it reports by answering nothing at all.
+ */
+private judge(res: *c.Result, conn: *c.Conn) -> Result[&Rows, Error]
+    if usize(res) == 0 then return Err(Error.NoMemory)
+
+    val status = c.result_status(res)
+
+    if status == c.TUPLES_OK then return Ok(Rows(res))
+    if status == c.COMMAND_OK then return Ok(Rows(res))
+    if status == c.SINGLE_TUPLE then return Ok(Rows(res))
+    if status == c.EMPTY_QUERY then return Ok(Rows(res))
+    if status == c.COPY_IN then return Ok(Rows(res))
+    if status == c.COPY_OUT then return Ok(Rows(res))
+    if status == c.COPY_BOTH then return Ok(Rows(res))
+
+    val state = field(res, c.DIAG_SQLSTATE)
+    var why = from_cstring(c.result_error_message(res)).unwrap_or("")
+
+    if why == "" then why = from_cstring(c.error_message(conn)).unwrap_or("")
+
+    // **Nothing owns the result on this path**, because no `Rows` was made for it — a `Rows` built
+    // here would be a plain value rather than a box, and a destructor runs for a box and for nothing
+    // else. So the result is cleared where it is, which is the only place that can.
+    c.clear(res)
+
+    Err(Error.Failed(state, why))
+end judge
+
+private field(res: *c.Result, code: i32) -> string
+    val p = c.result_error_field(res, code)
+
+    if usize(p) == 0 then "" else from_cstring(p).unwrap_or("")
+
+private copied(b: []const u8) -> string
+    var out: Buf[u8] = buf()
+
+    out.extend(b)
+
+    from_utf8_unchecked(out.view())
+
+private truth(b: []const u8) -> Option[bool]
+    if b.len != 1 then return None
+    if b[0] == u8('t') || b[0] == 1 then return Some(true)
+    if b[0] == u8('f') || b[0] == 0 then return Some(false)
+
+    None
+end truth
+
+/** `\x48656c6c6f` back into bytes. Anything else -- including PostgreSQL's pre-9.0 `escape` format,
+ * which nobody has had as the default this century -- answers `None` rather than guessing.
+ */
+private unhex(b: []const u8) -> Option[Buf[u8]]
+    if b.len < 2 || b[0] != u8('\\') || b[1] != u8('x') then return None
+    if (b.len - 2) % 2 != 0 then return None
+
+    var out = buf_with_capacity((b.len - 2) / 2, u8(0))
+
+    out.clear()
+
+    var i: usize = 2
+
+    while i < b.len
+        val hi = nibble(b[i])
+        val lo = nibble(b[i + 1])
+
+        if hi.is_none() || lo.is_none() then return None
+
+        out.push(hi.unwrap() * 16 + lo.unwrap())
+
+        i += 2
+
+    Some(out)
+end unhex
+
+private nibble(x: u8) -> Option[u8]
+    if x >= u8('0') && x <= u8('9') then return Some(x - u8('0'))
+    if x >= u8('a') && x <= u8('f') then return Some(x - u8('a') + 10)
+    if x >= u8('A') && x <= u8('F') then return Some(x - u8('A') + 10)
+
+    None
+end nibble

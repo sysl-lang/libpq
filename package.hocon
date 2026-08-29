@@ -1,0 +1,56 @@
+// libpq -- PostgreSQL for sysl, bound with no C of our own.
+//
+// This is the block a consumer writes to reach this package:
+//
+//     dependencies {
+//       postgres { git = "github.com/sysl-lang/libpq", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
+// tag `v0.1.0` on this repository. **The module is `sh.sysl.postgres`** -- the repository is named
+// for the library it binds and the module for the thing it talks to, which is the same split
+// `hiredis`/`sh.sysl.redis` already makes.
+//
+// **libpq has to be installed, and so do its headers.** Nothing is vendored, and the reason is the
+// org's rule rather than the size of the download: vendoring is a claim that the code can run
+// somewhere a package manager cannot reach, and there is no microcontroller that wants a PostgreSQL
+// client. libpq is also a component of a server distribution with its own build system, and a copy
+// here would be a copy nobody updates.
+//
+//     brew install libpq              # macOS, or the whole of postgresql@16
+//     sudo apt install libpq-dev      # Debian / Ubuntu
+//     sudo pacman -S postgresql-libs  # Arch
+//
+// **The build needs no flags**, because libpq installs `libpq.pc` beside itself and the
+// `pkg_config` requirement below asks the machine where it is. On macOS the keg-only `libpq`
+// formula is not on the default search path, so a `brew install libpq` alone wants
+//
+//     export PKG_CONFIG_PATH=/opt/homebrew/opt/libpq/lib/pkgconfig
+//
+// which `postgresql@16` does not need.
+
+package {
+  name    = "postgres"
+  version = "0.1.0"
+
+  // The compiler this was written against and the only one it is known to build with. Lower it when
+  // somebody builds this with an older one -- a floor is meant to be a fact rather than a guess.
+  sysl = "0.0.90"
+}
+
+// **`heap`, because every handle is one libpq allocated.** A `PGconn`, a `PGresult`, a `PGcancel`,
+// the string `PQescapeIdentifier` hands back and the `PGnotify` `PQnotifies` hands back are all
+// pointers this package frees exactly once; nothing here asks a caller for storage.
+//
+// **`posix`, because a database client is a socket and a pile of files.** libpq opens a TCP or Unix
+// socket, reads `~/.pgpass` and `~/.pg_service.conf`, reads `PGHOST`/`PGUSER`/`PGPASSWORD` and the
+// rest of the environment, and reaches the machine's certificate store when the connection is TLS.
+// There is no freestanding target where any of that means anything.
+requires {
+  heap  = true
+  posix = true
+
+  pkg_config {
+    libpq = "PostgreSQL's client library -- `brew install libpq` on macOS, Debian's libpq-dev, Arch's postgresql-libs"
+  }
+}
