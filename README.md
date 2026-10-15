@@ -2,6 +2,8 @@
 
 A binding of PostgreSQL's own client library, with **no C of its own**.
 
+*An independent sysl package for PostgreSQL. It is not affiliated with or endorsed by PostgreSQL's authors or trademark holders.*
+
 ```sysl
 import sh.sysl.postgres.*
 
