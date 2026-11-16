@@ -406,8 +406,8 @@ the_async_path()
                 None -> draining = false
 
     assert_eq(seen.len(), 2, "both rows arrived")
-    assert_eq(seen.at(0), 11, "the first")
-    assert_eq(seen.at(1), 22, "the second")
+    assert_eq(seen[0], 11, "the first")
+    assert_eq(seen[1], 22, "the second")
 
 // The rule that is easy to get wrong: a connection whose last result was never collected refuses the
 // next command. This is that rule, stated as a test.
@@ -588,7 +588,7 @@ many_parameters_survive_the_buffer_growing()
     assert_eq(rows.columns(), 64, "sixty-four columns came back")
 
     for i in 0..<rows.columns()
-        assert_eq(rows.text(0, i).unwrap(), wanted.at(i), s"parameter $i")
+        assert_eq(rows.text(0, i).unwrap(), wanted[i], s"parameter $i")
 
 // A NULL sitting between values is where an off-by-one in the pointer array shows up: the null
 // pointer has to land in the right slot, and the values on either side must not shift.

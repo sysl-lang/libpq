@@ -60,6 +60,7 @@ module sh.sysl.postgres
 
 import sh.sysl.postgres.c
 import sysl.buf.{Buf, buf, buf_with_capacity}
+import sysl.raw.ptr_cast
 import sysl.slices.{as_ptr, as_mut_ptr}
 import sysl.text.{cstring, from_cstring, from_utf8_unchecked, parse_long, parse_real, parse_ulong}
 
@@ -635,11 +636,11 @@ private struct Bound
     private formats: Buf[i32]
     private values: Buf[*u8]
 
-    private pointers(*self) -> **u8 = as_mut_ptr(self.values.view())
+    private pointers(*self) -> **u8 = as_mut_ptr(self.values.view_mut())
 
-    private sizes(*self) -> *i32 = as_mut_ptr(self.lengths.view())
+    private sizes(*self) -> *i32 = as_mut_ptr(self.lengths.view_mut())
 
-    private kinds(*self) -> *i32 = as_mut_ptr(self.formats.view())
+    private kinds(*self) -> *i32 = as_mut_ptr(self.formats.view_mut())
 end Bound
 
 private const absent: usize = 18446744073709551615
@@ -666,7 +667,7 @@ private bind(params: []const Param) -> Bound
                 b.lengths.push(i32(xs.len))
                 b.formats.push(1)
 
-    val base = usize(as_mut_ptr(b.scratch.view()))
+    val base = usize(as_mut_ptr(b.scratch.view_mut()))
 
     for off in b.offsets.view()
         b.values.push(if off == absent then null else ptr_cast(base + off))
