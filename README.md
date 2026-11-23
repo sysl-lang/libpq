@@ -17,7 +17,7 @@ for r in 0..<rows.rows()
 
 ```
 dependencies {
-  postgres { git = "github.com/sysl-lang/libpq", version = "0.1.1" }
+  postgres { git = "github.com/sysl-lang/libpq", version = "0.1.2" }
 }
 ```
 

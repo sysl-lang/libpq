@@ -3,11 +3,11 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       postgres { git = "github.com/sysl-lang/libpq", version = "0.1.1" }
+//       postgres { git = "github.com/sysl-lang/libpq", version = "0.1.2" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.1.1` on this repository. **The module is `sh.sysl.postgres`** -- the repository is named
+// tag `v0.1.2` on this repository. **The module is `sh.sysl.postgres`** -- the repository is named
 // for the library it binds and the module for the thing it talks to, which is the same split
 // `hiredis`/`sh.sysl.redis` already makes.
 //
@@ -31,11 +31,11 @@
 
 package {
   name    = "postgres"
-  version = "0.1.1"
+  version = "0.1.2"
 
   // The compiler this was written against and the only one it is known to build with. Lower it when
   // somebody builds this with an older one -- a floor is meant to be a fact rather than a guess.
-  sysl = "0.11.6"
+  sysl = "0.13.0"
 }
 
 // **`heap`, because every handle is one libpq allocated.** A `PGconn`, a `PGresult`, a `PGcancel`,
